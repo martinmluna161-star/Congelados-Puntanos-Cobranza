@@ -184,8 +184,7 @@ tbody td.dom{font-size:10px;color:var(--gris);}
             <th>Domicilio</th>
             <th class="c">Condición</th>
             <th class="r">A Cobrar</th>
-            <th class="r">Queda Cta.Cte.</th>
-            <th class="r">Saldo Cta.Cte.</th>
+            <th class="r">Cta. Cte.</th>
             <th class="c"></th>
           </tr>
         </thead>
@@ -204,7 +203,7 @@ tbody td.dom{font-size:10px;color:var(--gris);}
     <!-- AGREGAR LÍNEA MANUAL -->
     <div class="section-title">Agregar línea manual <span>OPCIONAL</span></div>
     <div class="panel">
-      <div class="form-grid">
+      <div class="form-grid" style="grid-template-columns:80px 1fr 1fr 110px 130px 130px auto">
         <div class="field"><label>Cód.</label><input type="number" id="m-cod" placeholder="0000"></div>
         <div class="field"><label>Nombre / Razón Social</label><input type="text" id="m-razon" placeholder="Nombre del cliente"></div>
         <div class="field"><label>Domicilio</label><input type="text" id="m-dom" placeholder="Dirección"></div>
@@ -215,8 +214,7 @@ tbody td.dom{font-size:10px;color:var(--gris);}
           </select>
         </div>
         <div class="field"><label>A Cobrar ($)</label><input type="number" id="m-cobrar" placeholder="0" min="0" step="0.01"></div>
-        <div class="field"><label>Queda Cta.Cte. ($)</label><input type="number" id="m-cc" placeholder="0" min="0" step="0.01"></div>
-        <div class="field"><label>Saldo Cta.Cte. ($)</label><input type="number" id="m-saldo" placeholder="0" step="0.01"></div>
+        <div class="field"><label>Cta. Cte. ($)</label><input type="number" id="m-cc" placeholder="0" step="0.01"></div>
         <div class="field"><label>&nbsp;</label><button class="btn btn-amber" onclick="agregarManual()">+ Agregar</button></div>
       </div>
     </div>
@@ -400,24 +398,50 @@ function parsearCoda(rows) {
 }
 
 function parsearCt10(rows) {
+  // Returns Map: cod -> { saldo, razon, domicilio, condicion }
+  // ct10C structure:
+  //   Header row for client: col[1]=razon, col[3]=domicilio
+  //   Code row: col[0]=cod (string with dots like '2.179'), col[8]=saldo acumulado
+  //   Condicion row: col[9]='CON ' or '15D '
   const saldos = new Map();
-  for (const row of rows) {
+  let currentRazon = '', currentDom = '';
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    // Detect client name row: col[0] null, col[1] has name (string, not a date)
+    if ((row[0] === null || row[0] === undefined) &&
+         row[1] !== null && row[1] !== undefined &&
+         typeof row[1] === 'string' && row[1].trim().length > 2) {
+      currentRazon = row[1].trim();
+      currentDom   = row[3] ? String(row[3]).trim() : '';
+    }
+
+    // Detect code row: col[0] is a string like '385' or '2.179' or a small number
     const cod = row[0];
     if (cod === null || cod === undefined) continue;
-    // En ct10C los codigos de cliente vienen como strings numericos en col 0
-    let codInt;
-    if (typeof cod === 'number') {
-      codInt = Math.round(cod);
-    } else {
-      const s = String(cod).trim();
-      if (!s.match(/^\d+$/)) continue;  // solo strings puramente numericos
-      codInt = parseInt(s);
-    }
+    const codStr = String(cod).trim();
+    // Match numeric strings possibly with dots as thousand separators: '385', '2.179', '3.403'
+    if (!codStr.match(/^\d[\d.]*$/)) continue;
+    const codInt = parseInt(codStr.replace(/\./g, ''));
     if (isNaN(codInt) || codInt < 10) continue;
+
     const saldoRaw = row[8];
     if (saldoRaw === null || saldoRaw === undefined || saldoRaw === '') continue;
-    const s = typeof saldoRaw === 'number' ? saldoRaw : parseFloat(String(saldoRaw).replace(',','.'));
-    if (!isNaN(s)) saldos.set(codInt, s);
+    const saldo = typeof saldoRaw === 'number' ? saldoRaw
+                : parseFloat(String(saldoRaw).replace(',','.'));
+    if (isNaN(saldo)) continue;
+
+    // Look ahead for condicion: next few rows until next client block
+    let condicion = '';
+    for (let j = i+1; j < Math.min(i+5, rows.length); j++) {
+      const r = rows[j];
+      if (r[9] !== null && r[9] !== undefined && String(r[9]).trim()) {
+        condicion = String(r[9]).trim();
+        break;
+      }
+    }
+
+    saldos.set(codInt, { saldo, razon: currentRazon, domicilio: currentDom, condicion });
   }
   return saldos;
 }
@@ -441,25 +465,56 @@ function intentarProcesar() {
 }
 
 function construirFilas(clientes, saldos) {
-  const filas = [];
-  const sorted = [...clientes.entries()].sort((a,b) => a[1].razon.localeCompare(b[1].razon));
-  for (const [cod, c] of sorted) {
+  const filasMap = new Map();
+
+  // 1) Procesar todos los clientes del CoDA1B (los del camion de hoy)
+  for (const [cod, c] of clientes.entries()) {
     const condU = c.condicion.toUpperCase();
     const esCredito = condU.includes('7 DIAS') || condU.includes('15D') || condU.includes('DIAS');
-    const totalHoy = c.totalPedido + c.ncTotal;
-    const saldoCC = saldos.has(cod) ? saldos.get(cod) : null;
+    const totalHoy  = c.totalPedido + c.ncTotal;
+    const entryCC  = saldos.has(cod) ? saldos.get(cod) : null;
+    const saldoVal = entryCC ? entryCC.saldo : null;  // numeric saldo from ct10C
 
-    let aCobrar, quedaCC;
+    let aCobrar, ctaCte;
     if (esCredito) {
-      aCobrar  = (saldoCC !== null && saldoCC > 0) ? saldoCC : 0;
-      quedaCC  = totalHoy;
+      // 7 dias: A Cobrar = saldo acumulado en ct10C, Cta.Cte. = pedido de hoy
+      aCobrar = (saldoVal !== null && saldoVal > 0) ? saldoVal : 0;
+      ctaCte  = totalHoy;
     } else {
-      aCobrar  = Math.max(0, totalHoy);
-      quedaCC  = 0;
+      // Contado: A Cobrar = pedido de hoy
+      // Si tiene NC en ct10C (saldo negativo), mostrar en Cta.Cte como informativo
+      aCobrar = totalHoy;
+      ctaCte  = (saldoVal !== null && saldoVal < 0) ? saldoVal : null;
     }
-    filas.push({ cod, razon: c.razon, domicilio: c.domicilio,
-                 condicion: c.condicion, esCredito, aCobrar, quedaCC, saldoCC, manual: false });
+    filasMap.set(cod, {
+      cod, razon: c.razon.trim(), domicilio: (c.domicilio||'').trim(),
+      condicion: c.condicion.trim(), esCredito,
+      aCobrar, ctaCte, manual: false
+    });
   }
+
+  // 2) Procesar clientes del ct10C que NO están en el CoDA1B
+  //    (clientes de cta cte con saldo pendiente, no viajan hoy)
+  for (const [cod, entry] of saldos.entries()) {
+    if (filasMap.has(cod)) continue; // ya procesado
+    if (!entry || typeof entry !== 'object') continue;
+    const { razon, domicilio, condicion, saldo } = entry;
+    const condU = (condicion||'').toUpperCase();
+    const esCredito = condU.includes('15D') || condU.includes('7 DIAS');
+    // A cobrar = saldo acumulado en ct10C, Cta.Cte. = null
+    filasMap.set(cod, {
+      cod, razon: (razon||'').trim(), domicilio: (domicilio||'').trim(),
+      condicion: condicion||'', esCredito,
+      aCobrar: saldo, ctaCte: null, manual: false
+    });
+  }
+
+  // Ordenar por código numérico ascendente
+  const filas = [...filasMap.values()].sort((a,b) => {
+    const na = parseFloat(String(a.cod).replace('.','').replace(',','')) || 0;
+    const nb = parseFloat(String(b.cod).replace('.','').replace(',','')) || 0;
+    return na - nb;
+  });
   return filas;
 }
 
@@ -477,18 +532,20 @@ function renderTabla() {
   let totCobrar = 0, totCC = 0;
 
   filas.forEach((f, idx) => {
-    totCobrar += f.aCobrar;
-    totCC     += f.quedaCC;
+    totCobrar += (f.aCobrar || 0);
+    totCC     += (f.ctaCte > 0 ? f.ctaCte : 0);
     const tr = document.createElement('tr');
     if (f.manual) tr.classList.add('row-manual');
+    const ctaHtml = f.ctaCte !== null && f.ctaCte !== undefined
+      ? `<span class="${f.ctaCte < 0 ? 'val-saldo-neg' : 'val-cc'}">${f.ctaCte < 0 ? '-' : ''}$ ${Math.round(Math.abs(f.ctaCte)).toLocaleString('es-AR')}</span>`
+      : '<span class="val-empty">—</span>';
     tr.innerHTML = `
       <td class="c" style="color:var(--gris);font-size:11px;font-family:'DM Mono',monospace">${f.cod}</td>
       <td class="nombre">${esc(f.razon)}</td>
       <td class="dom">${esc(f.domicilio || '')}</td>
       <td class="c"><span class="badge ${f.esCredito?'badge-credito':'badge-contado'}">${f.esCredito?'7 días FF':'Contado'}</span>${f.manual?' <span class="badge badge-manual">manual</span>':''}</td>
       <td class="r val-cobrar">${fmtPesos(f.aCobrar)}</td>
-      <td class="r val-cc">${fmtPesos(f.quedaCC)}</td>
-      <td class="r ${f.saldoCC===null?'val-empty':f.saldoCC<0?'val-saldo-neg':'val-saldo-pos'}">${fmtPesosSigned(f.saldoCC)}</td>
+      <td class="r">${ctaHtml}</td>
       <td class="c"><button class="btn-del-row" onclick="eliminarFila(${idx})" title="Eliminar">✕</button></td>`;
     tbody.appendChild(tr);
   });
@@ -522,19 +579,18 @@ function agregarManual() {
   const dom    = document.getElementById('m-dom').value.trim();
   const cond   = document.getElementById('m-cond').value;
   const cobrar = parseFloat(document.getElementById('m-cobrar').value) || 0;
-  const cc     = parseFloat(document.getElementById('m-cc').value) || 0;
-  const saldo  = document.getElementById('m-saldo').value !== ''
-                   ? parseFloat(document.getElementById('m-saldo').value) : null;
+  const cc     = document.getElementById('m-cc').value !== ''
+                   ? parseFloat(document.getElementById('m-cc').value) : null;
 
   if (!razon) { toast('Ingresá al menos el nombre del cliente', 'err'); return; }
 
   const esCredito = cond.includes('7 DIAS');
   filasManual.push({ cod, razon, domicilio: dom, condicion: cond, esCredito,
-                     aCobrar: cobrar, quedaCC: cc, saldoCC: saldo, manual: true });
+                     aCobrar: cobrar, ctaCte: cc, manual: true });
   renderTabla();
 
   // Limpiar form
-  ['m-cod','m-razon','m-dom','m-cobrar','m-cc','m-saldo'].forEach(id => document.getElementById(id).value = '');
+  ['m-cod','m-razon','m-dom','m-cobrar','m-cc'].forEach(id => document.getElementById(id).value = '');
   document.getElementById('m-cond').value = 'Contado';
   toast('Línea agregada', 'ok');
 }
@@ -630,27 +686,30 @@ function generarPDF() {
   // ANCHOS DE COLUMNA  (sin columna Forma — se dibuja a mano)
   // #(9) | Cliente(48) | Cond(15) | ACobrar(25) | QuedaCC(25) | SaldoCC(25) | Corte(19) | [Forma se dibuja aparte]
   // Total sin Forma = 9+48+15+25+25+25+19 = 166mm  → Forma = 186-166 = 20mm
-  const COL = { num:9, cli:48, cond:15, cob:25, cc:25, saldo:25, corte:19, forma:20 };
-  const FORMA_X = ML + COL.num + COL.cli + COL.cond + COL.cob + COL.cc + COL.saldo + COL.corte;
-  // FORMA_X = 12 + 9+48+15+25+25+25+19 = 178mm
+  // Columnas: #(14) | Cliente(50) | Cond(15) | ACobrar(26) | CtaCte(26) | Corte(22) | Forma(33) = 186mm
+  const COL = { num:14, cli:50, cond:15, cob:26, cc:26, corte:22, forma:33 };
 
-  // Preparar datos para autoTable (sin columna Forma — celda vacía pero con ancho)
+  // Preparar datos para autoTable
   let totCobrar = 0, totCC = 0;
   const bodyRows = filas.map(f => {
-    totCobrar += f.aCobrar;
-    totCC     += f.quedaCC;
+    totCobrar += (f.aCobrar || 0);
+    totCC     += (f.ctaCte > 0 ? f.ctaCte : 0);
+    // ctaCte: si es positivo mostrar normal, si es negativo mostrar con signo
+    let ctaStr = '-';
+    if (f.ctaCte !== null && f.ctaCte !== undefined && f.ctaCte !== 0) {
+      ctaStr = fmtPesosPdf(f.ctaCte);
+    }
     return [
       String(f.cod),
-      f.razon + (f.domicilio ? '\n' + f.domicilio.substring(0,55) : ''),
-      f.esCredito ? '7 d\u00edas FF' : 'Contado',
-      f.aCobrar > 0  ? fmtPdf(f.aCobrar) : '-',
-      f.quedaCC > 0  ? fmtPdf(f.quedaCC) : '-',
-      fmtPesosPdf(f.saldoCC),
+      f.razon + (f.domicilio ? '\n' + f.domicilio.substring(0,60) : ''),
+      f.esCredito ? '7 dias FF' : 'Contado',
+      (f.aCobrar !== null && f.aCobrar !== 0) ? fmtPdf(f.aCobrar) : '-',
+      ctaStr,
       '',    // Corte — dibujado en didDrawCell
       '',    // Forma — dibujado en didDrawCell con rect()
     ];
   });
-  bodyRows.push(['', 'TOTALES', '', fmtPdf(totCobrar), fmtPdf(totCC), '', '', '']);
+  bodyRows.push(['', 'TOTALES', '', fmtPdf(totCobrar), fmtPdf(totCC > 0 ? totCC : null), '', '']);
 
   // Registro de posiciones Y de cada fila para dibujar checkboxes
   const rowPositions = [];
@@ -659,7 +718,7 @@ function generarPDF() {
     startY: curY,
     margin: { left: ML, right: MR },
     tableWidth: CW,
-    head: [['#','Cliente / Domicilio','Cond.','A Cobrar','Queda\nCta.Cte.','Saldo\nCta.Cte.','Corte /\nRechazo','Forma de\nCobro']],
+    head: [['#','Cliente / Domicilio','Cond.','A Cobrar','Cta. Cte.','Corte /\nRechazo','Forma de\nCobro']],
     body: bodyRows,
     columnStyles: {
       0: { cellWidth: COL.num,   halign:'center', fontSize:7 },
@@ -667,9 +726,8 @@ function generarPDF() {
       2: { cellWidth: COL.cond,  halign:'center', fontSize:7 },
       3: { cellWidth: COL.cob,   halign:'right',  fontSize:7.5, fontStyle:'bold' },
       4: { cellWidth: COL.cc,    halign:'right',  fontSize:7 },
-      5: { cellWidth: COL.saldo, halign:'right',  fontSize:7 },
-      6: { cellWidth: COL.corte, halign:'center', fontSize:7 },
-      7: { cellWidth: COL.forma },
+      5: { cellWidth: COL.corte, halign:'center', fontSize:7 },
+      6: { cellWidth: COL.forma },
     },
     headStyles: {
       fillColor: AZUL, textColor: BLANCO,
@@ -696,45 +754,39 @@ function generarPDF() {
       }
       if (!row || d.section !== 'body') return;
       if (d.column.index === 2) { d.cell.styles.textColor = row.esCredito ? AMBER : TEAL; d.cell.styles.fontStyle='bold'; }
-      if (d.column.index === 3 && row.aCobrar > 0) d.cell.styles.textColor = AZUL;
-      if (d.column.index === 4 && row.quedaCC > 0) d.cell.styles.textColor = AMBER;
-      if (d.column.index === 5 && row.saldoCC !== null) {
-        d.cell.styles.textColor = row.saldoCC < 0 ? TEAL : CORAL;
-        d.cell.styles.fontStyle = 'bold';
+      if (d.column.index === 3 && row.aCobrar) d.cell.styles.textColor = AZUL;
+      if (d.column.index === 4 && row.ctaCte !== null) {
+        d.cell.styles.textColor = (row.ctaCte < 0) ? TEAL : AMBER;
+        if (row.ctaCte < 0) d.cell.styles.fontStyle = 'bold';
       }
-      // Vaciar texto de las celdas que se dibujan manualmente
-      if (d.column.index === 6 || d.column.index === 7) d.cell.text = [];
+      // Vaciar texto de las celdas que se dibujan manualmente (col 5=Corte, col 6=Forma)
+      if (d.column.index === 5 || d.column.index === 6) d.cell.text = [];
     },
     didDrawCell: (d) => {
       if (d.section !== 'body') return;
       const isTotal = (d.row.index === filas.length);
       if (isTotal) return;
 
-      // Guardar posición Y de la celda (col 0 de cada fila data)
-      if (d.column.index === 0) {
-        rowPositions[d.row.index] = { y: d.cell.y, h: d.cell.height, page: doc.internal.getCurrentPageInfo().pageNumber };
-      }
-
-      // CORTE / RECHAZO — línea horizontal
-      if (d.column.index === 6) {
+      // CORTE / RECHAZO — línea horizontal (col 5)
+      if (d.column.index === 5) {
         doc.setDrawColor(...BORDE);
         doc.setLineWidth(0.4);
         doc.line(d.cell.x + 2, d.cell.y + d.cell.height/2 + 0.5,
                  d.cell.x + d.cell.width - 2, d.cell.y + d.cell.height/2 + 0.5);
       }
 
-      // FORMA DE COBRO — dibujar label + rect vacío por cada opción
-      if (d.column.index === 7) {
+      // FORMA DE COBRO — label + checkbox vacío (col 6)
+      if (d.column.index === 6) {
         const labels  = ['Efectivo', 'Transf.', 'Cheque'];
         const cellH   = d.cell.height;
-        const rowH    = cellH / 3;          // altura por opción
-        const lx      = d.cell.x + 1.5;    // x del texto
-        const bw      = 3.2;               // ancho del checkbox
-        const bh      = 2.8;               // alto del checkbox
-        const bx      = d.cell.x + d.cell.width - bw - 1;  // x del checkbox (pegado a la derecha)
+        const rowH    = cellH / 3;
+        const lx      = d.cell.x + 2;
+        const bw      = 3.2;
+        const bh      = 2.8;
+        const bx      = d.cell.x + d.cell.width - bw - 1.5;
 
         doc.setFont('helvetica','normal');
-        doc.setFontSize(6.2);
+        doc.setFontSize(6.5);
         doc.setTextColor(60,60,60);
         doc.setDrawColor(150,150,140);
         doc.setFillColor(255,255,255);
